@@ -167,6 +167,85 @@ app.get("/api/letterboxd/top500", async (req, res) => {
   }
 });
 
+// ---------- Poster lookup ----------
+// Letterboxd list pages lazy-load their posters, so scraped posters are usually empty.
+// This endpoint finds one by title/year: TMDB if TMDB_API_KEY is set, otherwise the
+// keyless iTunes movie search.
+const posterMemo = new Map();
+const norm = (s) =>
+  String(s || "").toLowerCase().normalize("NFKD").replace(/[^a-z0-9]+/g, " ").trim();
+
+async function tmdbPoster(title, year) {
+  for (const y of year ? [year, ""] : [""]) {
+    const params = new URLSearchParams({
+      api_key: process.env.TMDB_API_KEY,
+      query: title,
+      include_adult: "false"
+    });
+    if (y) params.set("year", y);
+    const r = await fetch(`https://api.themoviedb.org/3/search/movie?${params}`, {
+      signal: AbortSignal.timeout(8000)
+    });
+    if (!r.ok) throw new Error(`TMDB HTTP ${r.status}`);
+    const data = await r.json();
+    const results = (data.results || []).filter((m) => m.poster_path);
+    const hit = results.find((m) => norm(m.title) === norm(title)) || results[0];
+    if (hit) return `https://image.tmdb.org/t/p/w500${hit.poster_path}`;
+  }
+  return "";
+}
+
+async function itunesPoster(title, year) {
+  const params = new URLSearchParams({
+    term: title,
+    media: "movie",
+    entity: "movie",
+    limit: "15",
+    country: "us"
+  });
+  const r = await fetch(`https://itunes.apple.com/search?${params}`, {
+    signal: AbortSignal.timeout(8000)
+  });
+  if (!r.ok) throw new Error(`iTunes HTTP ${r.status}`);
+  const data = await r.json();
+  const want = norm(title);
+  const y = Number(year) || 0;
+  const matches = (data.results || [])
+    .filter((m) => m.artworkUrl100)
+    .map((m) => ({ m, name: norm(m.trackName), yr: new Date(m.releaseDate).getFullYear() }))
+    .filter((c) => c.name === want || c.name.startsWith(`${want} `));
+  if (!matches.length) return "";
+  const best = y
+    ? matches.sort((a, b) => Math.abs(a.yr - y) - Math.abs(b.yr - y))[0]
+    : matches[0];
+  if (y && Math.abs(best.yr - y) > 1) return "";
+  return best.m.artworkUrl100.replace(/\d+x\d+bb/, "600x900bb");
+}
+
+app.get("/api/poster", async (req, res) => {
+  const title = String(req.query.title || "").trim();
+  const year = String(req.query.year || "").trim();
+  if (!title) return res.status(400).json({ error: "title is required" });
+
+  const key = `${norm(title)}|${year}`;
+  if (posterMemo.has(key)) {
+    res.set("Cache-Control", "public, max-age=86400, s-maxage=604800");
+    return res.json({ poster: posterMemo.get(key) });
+  }
+
+  try {
+    let poster = "";
+    if (process.env.TMDB_API_KEY) poster = await tmdbPoster(title, year);
+    if (!poster) poster = await itunesPoster(title, year);
+    posterMemo.set(key, poster);
+    res.set("Cache-Control", "public, max-age=86400, s-maxage=604800");
+    res.json({ poster });
+  } catch (error) {
+    // Don't cache transient failures.
+    res.json({ poster: "", error: error.message });
+  }
+});
+
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
 // Serve the production build when present (works on Express 4 and 5).
