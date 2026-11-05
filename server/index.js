@@ -177,6 +177,11 @@ app.use((req, res, next) => {
   res.sendFile(path.join(dist, "index.html"), (err) => err && next(err));
 });
 
-app.listen(PORT, () => {
-  console.log(`Frame Roulette server listening at http://localhost:${PORT}`);
-});
+// Vercel runs the exported app as a serverless function, so only listen locally.
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`Frame Roulette server listening at http://localhost:${PORT}`);
+  });
+}
+
+export default app;
