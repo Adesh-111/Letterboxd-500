@@ -1,11 +1,19 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import Papa from "papaparse";
-import { RefreshCw, Upload, RotateCcw, Film, ExternalLink, Check, X, Search, Shuffle } from "lucide-react";
+import {
+  RefreshCw, Upload, RotateCcw, Film, ExternalLink, Check, X, Search, Shuffle, Sparkles
+} from "lucide-react";
 import "./styles.css";
 
 const STORE_KEY = "frame-roulette-state-v1";
+const POSTER_KEY = "frame-roulette-posters-v1";
 const DEFAULT_SOURCE = "https://letterboxd.com/official/list/letterboxds-top-500-films/";
+const SPIN_MS = 5200;
+const PAGE_SIZE = 60;
+const WHEEL_COLORS = ["#8c1d2c", "#1d4e5f", "#b8801f", "#4a2b66", "#1f6b4f", "#a14a1a"];
+
+/* ---------------- storage + helpers ---------------- */
 
 function safeLoad() {
   try {
@@ -20,6 +28,7 @@ function safeLoad() {
     return { movies: [], picked: [], history: [], source: "empty" };
   }
 }
+
 function normalizeMovie(row, index) {
   const title = row.title || row.Name || row.Film || row["Film Name"] || row["Movie Title"];
   if (!title) return null;
@@ -32,9 +41,180 @@ function normalizeMovie(row, index) {
     year: String(year).trim(),
     rank: Number(row.rank || row.Position || row.Rank || index + 1),
     poster: String(poster).trim(),
-    letterboxdUrl: String(url).startsWith("http") ? String(url) : (url ? `https://letterboxd.com${url}` : "")
+    letterboxdUrl: String(url).startsWith("http") ? String(url) : url ? `https://letterboxd.com${url}` : ""
   };
 }
+
+function sample(arr, n) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a.slice(0, n);
+}
+
+/* ---------------- poster loading ---------------- */
+// Posters scraped from Letterboxd are often empty, so missing ones are looked up through
+// /api/poster (a few at a time) and remembered in localStorage.
+
+function loadPosterCache() {
+  try {
+    return JSON.parse(localStorage.getItem(POSTER_KEY) || "{}");
+  } catch {
+    return {};
+  }
+}
+const posterCache = loadPosterCache();
+const inflight = new Map();
+const queue = [];
+let active = 0;
+
+function pump() {
+  while (active < 4 && queue.length) {
+    const job = queue.shift();
+    active++;
+    job().finally(() => {
+      active--;
+      pump();
+    });
+  }
+}
+
+function requestPoster(movie) {
+  if (movie.id in posterCache) return Promise.resolve(posterCache[movie.id]);
+  if (inflight.has(movie.id)) return inflight.get(movie.id);
+  const promise = new Promise((resolve) => {
+    queue.push(async () => {
+      try {
+        const qs = new URLSearchParams({ title: movie.title, year: movie.year || "" });
+        const response = await fetch(`/api/poster?${qs}`);
+        const data = response.ok ? await response.json() : {};
+        if (!data.error) {
+          posterCache[movie.id] = data.poster || "";
+          try {
+            localStorage.setItem(POSTER_KEY, JSON.stringify(posterCache));
+          } catch {}
+        }
+        resolve(data.poster || "");
+      } catch {
+        resolve("");
+      }
+    });
+    pump();
+  }).finally(() => inflight.delete(movie.id));
+  inflight.set(movie.id, promise);
+  return promise;
+}
+
+function usePoster(movie, ignoreOwn = false, enabled = true) {
+  const own = !ignoreOwn && movie?.poster ? movie.poster : "";
+  const [fetched, setFetched] = useState(() => (movie && posterCache[movie.id]) || "");
+  useEffect(() => {
+    if (!movie || !enabled || own) return;
+    if (movie.id in posterCache) {
+      setFetched(posterCache[movie.id]);
+      return;
+    }
+    let alive = true;
+    requestPoster(movie).then((url) => alive && setFetched(url));
+    return () => {
+      alive = false;
+    };
+  }, [movie?.id, enabled, own]);
+  return own || fetched;
+}
+
+function Poster({ movie, eager = false, className = "" }) {
+  const ref = useRef(null);
+  const [visible, setVisible] = useState(eager);
+  const [broken, setBroken] = useState(false);
+  const [dead, setDead] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    if (visible) return;
+    const el = ref.current;
+    if (!el || typeof IntersectionObserver === "undefined") {
+      setVisible(true);
+      return;
+    }
+    const io = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting) {
+          setVisible(true);
+          io.disconnect();
+        }
+      },
+      { rootMargin: "300px" }
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, [visible]);
+
+  const src = usePoster(movie, broken, visible);
+
+  return (
+    <div ref={ref} className={`poster ${loaded ? "is-loaded" : ""} ${className}`}>
+      <div className="poster-fallback">
+        <Film size={26} />
+        <span>{movie.title}</span>
+      </div>
+      {src && !dead && (
+        <img
+          key={src}
+          src={src}
+          alt={`${movie.title} poster`}
+          referrerPolicy="no-referrer"
+          loading={eager ? "eager" : "lazy"}
+          onLoad={() => setLoaded(true)}
+          onError={() => {
+            if (!broken && movie.poster && src === movie.poster) {
+              setBroken(true);
+              setLoaded(false);
+            } else {
+              setDead(true);
+            }
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ---------------- winner card ---------------- */
+
+function WinnerCard({ winner, onRemove, onClear }) {
+  const backdrop = usePoster(winner, false, true);
+  return (
+    <div className="winner-card" style={{ "--backdrop": backdrop ? `url("${backdrop}")` : "none" }}>
+      <div className="winner-poster">
+        <Poster key={winner.id} movie={winner} eager />
+      </div>
+      <div className="winner-meta">
+        <span className="eyebrow"><Sparkles size={13} /> THE WHEEL HAS SPOKEN</span>
+        <h2>{winner.title}</h2>
+        <p>
+          {winner.year || "Feature film"}
+          {winner.rank ? ` · #${winner.rank} on the list` : ""}
+        </p>
+      </div>
+      <div className="winner-buttons">
+        <button className="primary-button" onClick={onRemove}>
+          <Check size={16} /> Watched it — remove from wheel
+        </button>
+        {winner.letterboxdUrl && (
+          <a className="secondary-button" href={winner.letterboxdUrl} target="_blank" rel="noreferrer">
+            Open on Letterboxd <ExternalLink size={14} />
+          </a>
+        )}
+        <button className="text-button" onClick={onClear}>Keep it in the wheel</button>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- app ---------------- */
 
 function App() {
   const initial = useMemo(safeLoad, []);
@@ -46,22 +226,38 @@ function App() {
   const [notice, setNotice] = useState("");
   const [winner, setWinner] = useState(null);
   const [spinning, setSpinning] = useState(false);
+  const [noAnim, setNoAnim] = useState(false);
   const [rotation, setRotation] = useState(0);
   const [query, setQuery] = useState("");
   const [showHistory, setShowHistory] = useState(false);
   const [wheelCount, setWheelCount] = useState(12);
+  const [wheelFilms, setWheelFilms] = useState([]);
+  const [limit, setLimit] = useState(PAGE_SIZE);
   const fileInput = useRef(null);
-  const wheelRef = useRef(null);
+  const panelRef = useRef(null);
 
   useEffect(() => {
     localStorage.setItem(STORE_KEY, JSON.stringify({ movies, picked, history, source }));
   }, [movies, picked, history, source]);
 
-  const remaining = useMemo(() => movies.filter(m => !picked.includes(m.id)), [movies, picked]);
+  const remaining = useMemo(() => movies.filter((m) => !picked.includes(m.id)), [movies, picked]);
   const visibleMovies = useMemo(() => {
     const q = query.toLowerCase().trim();
-    return remaining.filter(m => !q || `${m.title} ${m.year}`.toLowerCase().includes(q));
+    return remaining.filter((m) => !q || `${m.title} ${m.year}`.toLowerCase().includes(q));
   }, [remaining, query]);
+
+  useEffect(() => setLimit(PAGE_SIZE), [query, movies]);
+
+  // Re-deal the wheel whenever the pool or slice count changes (never mid-spin or while a winner shows).
+  useEffect(() => {
+    setWheelFilms(sample(remaining, Math.min(wheelCount, remaining.length)));
+  }, [remaining.length, wheelCount, movies]);
+
+  useEffect(() => {
+    if (winner && window.innerWidth < 900) {
+      panelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }, [winner]);
 
   async function syncLetterboxd() {
     setLoading(true);
@@ -90,7 +286,7 @@ function App() {
     Papa.parse(file, {
       header: true,
       skipEmptyLines: true,
-      complete: ({ data, errors }) => {
+      complete: ({ data }) => {
         const next = data.map(normalizeMovie).filter(Boolean);
         if (!next.length) {
           setNotice("No movie titles were found. CSV needs a title/name/film column.");
@@ -107,23 +303,37 @@ function App() {
     });
   }
 
+  // The winner is chosen first, then the wheel is rotated so that slice stops under the pointer.
   function chooseMovie() {
     if (spinning || !remaining.length) return;
-    const selected = remaining[Math.floor(Math.random() * remaining.length)];
+    const pool = sample(remaining, Math.min(wheelCount, remaining.length));
+    const idx = Math.floor(Math.random() * pool.length);
+    const seg = 360 / pool.length;
+    const center = (idx + 0.5) * seg;
+    const jitter = (Math.random() - 0.5) * seg * 0.6;
+
     setSpinning(true);
     setWinner(null);
-    const turns = 5 + Math.random() * 5;
-    setRotation(prev => prev + turns * 360 + Math.random() * 360);
-    window.setTimeout(() => {
-      setSpinning(false);
-      setWinner(selected);
-    }, 4200);
+    setNoAnim(true);
+    setWheelFilms(pool);
+    setRotation(0);
+
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        setNoAnim(false);
+        setRotation(360 * (6 + Math.floor(Math.random() * 3)) + (360 - center) + jitter);
+        window.setTimeout(() => {
+          setSpinning(false);
+          setWinner(pool[idx]);
+        }, SPIN_MS + 150);
+      })
+    );
   }
 
   function removeWinner() {
     if (!winner) return;
-    setPicked(prev => [...prev, winner.id]);
-    setHistory(prev => [winner, ...prev]);
+    setPicked((prev) => [...prev, winner.id]);
+    setHistory((prev) => [winner, ...prev]);
     setWinner(null);
   }
   function resetPicks() {
@@ -133,84 +343,113 @@ function App() {
     setWinner(null);
   }
   function restoreMovie(movie) {
-    setPicked(prev => prev.filter(id => id !== movie.id));
-    setHistory(prev => prev.filter(item => item.id !== movie.id));
+    setPicked((prev) => prev.filter((id) => id !== movie.id));
+    setHistory((prev) => prev.filter((item) => item.id !== movie.id));
   }
 
-  const segments = useMemo(() => {
-    if (!remaining.length) return [];
-    return remaining.slice(0, Math.min(wheelCount, remaining.length));
-  }, [remaining, wheelCount]);
-
-  const wheelStyle = {
-    transform: `rotate(${rotation}deg)`,
-    background: segments.length
-      ? `conic-gradient(${segments.map((m, i) => {
-          const a = (i / segments.length) * 360;
-          const b = ((i + 1) / segments.length) * 360;
-          return `${i % 2 ? "#292923" : "#39382f"} ${a}deg ${b}deg`;
-        }).join(", ")})`
-      : "#282821"
-  };
+  const n = wheelFilms.length;
+  const wheelBackground = n
+    ? `conic-gradient(${wheelFilms
+        .map((_, i) => {
+          const a = (i / n) * 360;
+          const b = ((i + 1) / n) * 360;
+          const c = WHEEL_COLORS[i % WHEEL_COLORS.length];
+          return `${c} ${a}deg ${b - 0.8}deg, #0a0a0c ${b - 0.8}deg ${b}deg`;
+        })
+        .join(", ")})`
+    : "#1a1a1f";
+  const labelSize = n <= 8 ? 15 : n <= 12 ? 13 : 11.5;
 
   return (
     <main className="app-shell">
       <header className="topbar">
-        <a className="brand" href="#" aria-label="Frame Roulette home"><span className="brand-mark">F</span> FRAME<span className="brand-light">ROULETTE</span></a>
+        <a className="brand" href="#" aria-label="Frame Roulette home">
+          <span className="brand-mark">F</span> FRAME<span className="brand-light">ROULETTE</span>
+        </a>
         <div className="top-actions">
-          <a className="source-link" href={DEFAULT_SOURCE} target="_blank" rel="noreferrer">LETTERBOXD TOP 500 <ExternalLink size={13}/></a>
-          <button className="icon-button" title="Reset selections" onClick={resetPicks}><RotateCcw size={16}/></button>
+          <a className="source-link" href={DEFAULT_SOURCE} target="_blank" rel="noreferrer">
+            LETTERBOXD TOP 500 <ExternalLink size={13} />
+          </a>
+          <button className="icon-button" title="Reset selections" onClick={resetPicks}>
+            <RotateCcw size={16} />
+          </button>
         </div>
       </header>
 
       <section className="hero">
-        <div className="eyebrow"><span className="live-dot"/> THE CINEMA CHOOSES YOU</div>
-        <h1>ONE SPIN.<br/><em>ONE FILM.</em></h1>
-        <p className="hero-copy">A little less scrolling. A little more cinema.<br/>Find your next watch from Letterboxd's Top 500.</p>
+        <div className="eyebrow"><span className="live-dot" /> THE CINEMA CHOOSES YOU</div>
+        <h1>ONE SPIN.<br /><em>ONE FILM.</em></h1>
+        <p className="hero-copy">
+          A little less scrolling. A little more cinema.<br />
+          Find your next watch from Letterboxd's Top 500.
+        </p>
         <div className="stats-row">
           <div><strong>{remaining.length.toLocaleString()}</strong><span>IN THE WHEEL</span></div>
-          <div className="stat-divider"/>
-          <div><strong>{picked.length}</strong><span>SELECTED</span></div>
-          <div className="stat-divider"/>
-          <div><strong>{movies.length ? Math.round(picked.length / movies.length * 100) : 0}%</strong><span>COMPLETE</span></div>
+          <div className="stat-divider" />
+          <div><strong>{picked.length}</strong><span>WATCHED</span></div>
+          <div className="stat-divider" />
+          <div>
+            <strong>{movies.length ? Math.round((picked.length / movies.length) * 100) : 0}%</strong>
+            <span>COMPLETE</span>
+          </div>
         </div>
       </section>
 
       <section className="roulette-section">
         <div className="wheel-column">
-          <div className="wheel-stage">
-            <div className="wheel-pointer"/>
-            <div className={`wheel ${spinning ? "is-spinning" : ""}`} style={wheelStyle} ref={wheelRef}>
-              {segments.map((movie, i) => {
-                const angle = (i + .5) * (360 / segments.length);
-                return <span className="wheel-label" key={movie.id} style={{ transform: `rotate(${angle}deg) translateY(-${Math.min(155, 210 - segments.length * 2)}px) rotate(90deg)` }}>{movie.title}</span>;
-              })}
-              <div className="wheel-center"><span>FRAME</span><strong>500</strong><small>FILM ROULETTE</small></div>
+          <div className={`wheel-stage ${spinning ? "is-spinning" : ""}`}>
+            <div className="wheel-pointer" />
+            <div
+              className={`wheel ${noAnim ? "no-anim" : ""}`}
+              style={{ transform: `rotate(${rotation}deg)`, background: wheelBackground, "--spin-ms": `${SPIN_MS}ms` }}
+            >
+              {wheelFilms.map((movie, i) => (
+                <div
+                  className="wheel-label"
+                  key={`${movie.id}-${i}`}
+                  style={{ transform: `rotate(${(i + 0.5) * (360 / n) - 90}deg)`, fontSize: `${labelSize}px` }}
+                >
+                  <span>{movie.title}</span>
+                </div>
+              ))}
+            </div>
+            <div className="wheel-hub">
+              <span>FRAME</span>
+              <strong>500</strong>
             </div>
           </div>
+
           <button className="spin-button" disabled={spinning || !remaining.length} onClick={chooseMovie}>
-            <Shuffle size={17}/>{spinning ? "CHOOSING..." : remaining.length ? "SPIN THE WHEEL" : "ALL FILMS SELECTED"}
+            <Shuffle size={18} />
+            {spinning ? "CHOOSING..." : remaining.length ? "SPIN THE WHEEL" : "ALL FILMS WATCHED"}
           </button>
-          <p className="wheel-hint">The pick is random from all remaining films.</p>
+
+          <div className="slice-picker" aria-label="Number of slices">
+            <span>SLICES</span>
+            {[8, 12, 16].map((count) => (
+              <button
+                key={count}
+                className={wheelCount === count ? "is-active" : ""}
+                disabled={spinning}
+                onClick={() => setWheelCount(count)}
+              >
+                {count}
+              </button>
+            ))}
+          </div>
+          <p className="wheel-hint">Each spin deals a fresh set of slices from the films you haven't watched.</p>
         </div>
 
-        <aside className="side-panel">
-          <div className="panel-head"><span className="eyebrow">YOUR NEXT WATCH</span><span className="tiny-dot"/></div>
+        <aside className="side-panel" ref={panelRef}>
+          <div className="panel-head">
+            <span className="eyebrow">YOUR NEXT WATCH</span>
+            <span className="tiny-dot" />
+          </div>
           {winner ? (
-            <div className="winner-card">
-              <div className="winner-poster">
-                {winner.poster ? <img src={winner.poster} alt={`${winner.title} poster`} onError={e => e.currentTarget.style.display = "none"}/> : <div className="poster-fallback"><Film size={34}/></div>}
-              </div>
-              <div className="winner-meta"><span className="eyebrow">THE WHEEL HAS SPOKEN</span><h2>{winner.title}</h2><p>{winner.year || "Feature film"}{winner.rank ? ` · #${winner.rank}` : ""}</p></div>
-              <div className="winner-buttons">
-                <button className="primary-button" onClick={removeWinner}><Check size={16}/> Remove from wheel</button>
-                {winner.letterboxdUrl && <a className="secondary-button" href={winner.letterboxdUrl} target="_blank" rel="noreferrer">Open on Letterboxd <ExternalLink size={14}/></a>}
-                <button className="text-button" onClick={() => setWinner(null)}>Spin again (keep this film)</button>
-              </div>
-            </div>
+            <WinnerCard winner={winner} onRemove={removeWinner} onClear={() => setWinner(null)} />
           ) : (
             <div className="empty-winner">
-              <div className="film-icon"><Film size={28}/></div>
+              <div className="film-icon"><Film size={30} /></div>
               <h2>{spinning ? "Finding your film..." : "Your next film awaits."}</h2>
               <p>{spinning ? "Trust the wheel." : "Hit spin and let fate decide what you watch tonight."}</p>
             </div>
@@ -221,35 +460,102 @@ function App() {
 
       <section className="collection-section">
         <div className="section-heading">
-          <div><span className="eyebrow">THE COLLECTION</span><h2>Films in the <em>roulette.</em></h2></div>
+          <div>
+            <span className="eyebrow">THE COLLECTION</span>
+            <h2>Films in the <em>roulette.</em></h2>
+          </div>
           <div className="collection-actions">
-            <label className="search-box"><Search size={15}/><input value={query} onChange={e => setQuery(e.target.value)} placeholder="Find a film..." /></label>
-            <button className="outline-button" onClick={syncLetterboxd} disabled={loading}><RefreshCw size={15} className={loading ? "spin-icon" : ""}/>{loading ? "Syncing..." : "Sync list"}</button>
-            <button className="outline-button" onClick={() => fileInput.current?.click()}><Upload size={15}/> Import CSV</button>
-            <input ref={fileInput} type="file" accept=".csv,text/csv" hidden onChange={e => { importCsv(e.target.files?.[0]); e.target.value = ""; }}/>
+            <label className="search-box">
+              <Search size={15} />
+              <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Find a film..." />
+            </label>
+            <button className="outline-button" onClick={syncLetterboxd} disabled={loading}>
+              <RefreshCw size={15} className={loading ? "spin-icon" : ""} />
+              {loading ? "Syncing..." : "Sync list"}
+            </button>
+            <button className="outline-button" onClick={() => fileInput.current?.click()}>
+              <Upload size={15} /> Import CSV
+            </button>
+            <input
+              ref={fileInput}
+              type="file"
+              accept=".csv,text/csv"
+              hidden
+              onChange={(e) => {
+                importCsv(e.target.files?.[0]);
+                e.target.value = "";
+              }}
+            />
           </div>
         </div>
-        {notice && <div className="notice"><span>{notice}</span><button onClick={() => setNotice("")} aria-label="Dismiss"><X size={15}/></button></div>}
-        <div className="collection-note"><span className="tiny-dot"/>{source === "letterboxd" ? "SYNCED FROM LETTERBOXD" : source === "csv" ? "IMPORTED CSV" : "READY TO SYNC"} <span className="muted">· Showing {visibleMovies.length} remaining films</span></div>
-        {movies.length === 0 ? (
-          <div className="import-empty"><Film size={26}/><h3>Your collection is waiting.</h3><p>Click <b>Sync list</b> to try the public Letterboxd list, or import a CSV export.</p><button className="primary-button" onClick={syncLetterboxd}><RefreshCw size={15}/> Sync Top 500</button></div>
-        ) : (
-          <div className="movie-grid">
-            {visibleMovies.slice(0, 60).map(movie => <article className="movie-tile" key={movie.id}>
-              <div className="tile-poster">
-                {movie.poster ? <img src={movie.poster} alt={`${movie.title} poster`} loading="lazy" onError={e => e.currentTarget.style.display = "none"}/> : <div className="poster-fallback"><Film size={25}/></div>}
-                {movie.rank && <span className="rank-tag">#{movie.rank}</span>}
-              </div>
-              <div className="tile-title">{movie.title}</div><div className="tile-year">{movie.year || " "}</div>
-            </article>)}
+
+        {notice && (
+          <div className="notice">
+            <span>{notice}</span>
+            <button onClick={() => setNotice("")} aria-label="Dismiss"><X size={15} /></button>
           </div>
         )}
-        {visibleMovies.length > 60 && <p className="more-note">Showing first 60 results. Search to narrow the list.</p>}
-        <div className="history-toggle"><button className="text-button" onClick={() => setShowHistory(v => !v)}>{showHistory ? "Hide" : "Show"} selected films ({history.length})</button></div>
-        {showHistory && <div className="history-list">{history.map(movie => <div className="history-row" key={movie.id}><span>{movie.title}{movie.year ? ` (${movie.year})` : ""}</span><button className="text-button" onClick={() => restoreMovie(movie)}>Restore to wheel</button></div>)}</div>}
+
+        <div className="collection-note">
+          <span className="tiny-dot" />
+          {source === "letterboxd" ? "SYNCED FROM LETTERBOXD" : source === "csv" ? "IMPORTED CSV" : "READY TO SYNC"}
+          <span className="muted"> · {visibleMovies.length} films remaining</span>
+        </div>
+
+        {movies.length === 0 ? (
+          <div className="import-empty">
+            <Film size={28} />
+            <h3>Your collection is waiting.</h3>
+            <p>Click <b>Sync list</b> to try the public Letterboxd list, or import a CSV export.</p>
+            <button className="primary-button" onClick={syncLetterboxd}>
+              <RefreshCw size={15} /> Sync Top 500
+            </button>
+          </div>
+        ) : (
+          <div className="movie-grid">
+            {visibleMovies.slice(0, limit).map((movie) => (
+              <article className="movie-tile" key={movie.id}>
+                <div className="tile-poster">
+                  <Poster movie={movie} />
+                  {movie.rank ? <span className="rank-tag">#{movie.rank}</span> : null}
+                </div>
+                <div className="tile-title">{movie.title}</div>
+                <div className="tile-year">{movie.year || "\u00A0"}</div>
+              </article>
+            ))}
+          </div>
+        )}
+
+        {visibleMovies.length > limit && (
+          <div className="more-wrap">
+            <button className="outline-button" onClick={() => setLimit((l) => l + PAGE_SIZE)}>
+              Show more ({visibleMovies.length - limit} left)
+            </button>
+          </div>
+        )}
+
+        <div className="history-toggle">
+          <button className="text-button" onClick={() => setShowHistory((v) => !v)}>
+            {showHistory ? "Hide" : "Show"} watched films ({history.length})
+          </button>
+        </div>
+        {showHistory && (
+          <div className="history-list">
+            {history.map((movie) => (
+              <div className="history-row" key={movie.id}>
+                <span>{movie.title}{movie.year ? ` (${movie.year})` : ""}</span>
+                <button className="text-button" onClick={() => restoreMovie(movie)}>Restore to wheel</button>
+              </div>
+            ))}
+          </div>
+        )}
       </section>
 
-      <footer><span>FRAME ROULETTE</span><span>MADE FOR THE LOVE OF FILM</span><a href={DEFAULT_SOURCE} target="_blank" rel="noreferrer">LETTERBOXD TOP 500 ↗</a></footer>
+      <footer>
+        <span>FRAME ROULETTE</span>
+        <span>MADE FOR THE LOVE OF FILM</span>
+        <a href={DEFAULT_SOURCE} target="_blank" rel="noreferrer">LETTERBOXD TOP 500 ↗</a>
+      </footer>
     </main>
   );
 }
