@@ -7,7 +7,7 @@ import {
 import "./styles.css";
 
 const STORE_KEY = "frame-roulette-state-v1";
-const POSTER_KEY = "frame-roulette-posters-v1";
+const POSTER_KEY = "frame-roulette-posters-v2"; // bumped to discard empty results cached by the earlier bug
 const DEFAULT_SOURCE = "https://letterboxd.com/official/list/letterboxds-top-500-films/";
 const SPIN_MS = 5200;
 const PAGE_SIZE = 60;
@@ -89,7 +89,11 @@ function requestPoster(movie) {
       try {
         const qs = new URLSearchParams({ title: movie.title, year: movie.year || "" });
         const response = await fetch(`/api/poster?${qs}`);
-        const data = response.ok ? await response.json() : {};
+        if (!response.ok) {
+          resolve(""); // endpoint missing or failing: don't remember this as "no poster"
+          return;
+        }
+        const data = await response.json();
         if (!data.error) {
           posterCache[movie.id] = data.poster || "";
           try {
