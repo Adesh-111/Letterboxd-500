@@ -222,6 +222,34 @@ async function itunesPoster(title, year) {
   return best.m.artworkUrl100.replace(/\d+x\d+bb/, "600x900bb");
 }
 
+// Wikipedia fallback: good coverage of arthouse/classic films that iTunes lacks.
+async function wikipediaPoster(title, year) {
+  const candidates = [
+    year ? `${title} (${year} film)` : null,
+    `${title} (film)`,
+    title
+  ].filter(Boolean);
+  for (const name of candidates) {
+    const r = await fetch(
+      `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(name.replace(/ /g, "_"))}`,
+      {
+        headers: { "User-Agent": "FrameRoulette/1.0 (personal movie selector)", Accept: "application/json" },
+        signal: AbortSignal.timeout(8000)
+      }
+    );
+    if (r.status === 404) continue;
+    if (!r.ok) throw new Error(`Wikipedia HTTP ${r.status}`);
+    const data = await r.json();
+    const looksLikeFilm = /film|movie/i.test(`${data.description || ""} ${data.extract || ""}`.slice(0, 400));
+    const src = data.thumbnail?.source || data.originalimage?.source;
+    if (looksLikeFilm && src) {
+      // Ask Wikimedia for a larger rendition of the thumbnail.
+      return src.replace(/\/(\d+)px-/, "/500px-");
+    }
+  }
+  return "";
+}
+
 app.get("/api/poster", async (req, res) => {
   const title = String(req.query.title || "").trim();
   const year = String(req.query.year || "").trim();
@@ -236,7 +264,12 @@ app.get("/api/poster", async (req, res) => {
   try {
     let poster = "";
     if (process.env.TMDB_API_KEY) poster = await tmdbPoster(title, year);
-    if (!poster) poster = await itunesPoster(title, year);
+    if (!poster) {
+      try {
+        poster = await itunesPoster(title, year);
+      } catch {}
+    }
+    if (!poster) poster = await wikipediaPoster(title, year);
     posterMemo.set(key, poster);
     res.set("Cache-Control", "public, max-age=86400, s-maxage=604800");
     res.json({ poster });
